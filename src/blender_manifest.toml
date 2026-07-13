@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "keyboard_generator"
+version = "0.1.0"
+name = "Keyboard Generator"
+tagline = "Generate 3D-printable keyboard plates from JSON config files"
+maintainer = "imadeathingie"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+# The add-on reads keylist .json files from disk, so it needs file access.
+[permissions]
+files = "Read keylist JSON files and write exported meshes"
