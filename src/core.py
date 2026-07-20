@@ -937,7 +937,7 @@ def _skirt_outer_rings(keylist_data):
         for vi in lp:
             u = override.get(vi, unit[vi])
             p = top.points[vi]
-            pts[vi] = (p[0] - u[0] * thickness, p[1] - u[1] * thickness, p[2])
+            pts[vi] = (p[0], p[1], p[2])
 
     loops = _perimeter_loops(top, hole_ids)
     if not loops:
