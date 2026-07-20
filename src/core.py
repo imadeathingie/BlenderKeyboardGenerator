@@ -1464,9 +1464,9 @@ def build_shell(keylist_data):
     if vertical_edges:
         for lp in _perimeter_loops(top, hole_ids):
             for vi in lp:
-                bx, by, _bz = bot_pts[vi]
-                tz = top_pts[vi][2]
-                top_pts[vi] = (bx, by, tz)  # top now directly above bottom
+                _bz = bot_pts[vi][2]
+                tx, ty, tz = top_pts[vi]
+                bot_pts[vi] = (tx, ty, _bz)  # bottom now directly below top
 
     # Assemble the final shell mesh.
     vertices = list(top_pts) + list(bot_pts)
