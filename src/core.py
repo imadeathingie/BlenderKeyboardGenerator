@@ -60,6 +60,38 @@ def _place(p_local, key):
     return (px + pos['x'], py + pos['y'], pz + pos['z'])
 
 
+def _unrot_xyz(p, rx_deg, ry_deg, rz_deg):
+    """
+    Inverse of _rot_xyz. _rot_xyz applies Z, then Y, then X; to undo it we
+    apply the inverse rotations in reverse order: X, then Y, then Z.
+    """
+    x, y, z = p
+    rz = math.radians(rz_deg)
+    ry = math.radians(ry_deg)
+    rx = math.radians(rx_deg)
+
+    # X^-1
+    y, z = y * math.cos(rx) + z * math.sin(rx), -y * math.sin(rx) + z * math.cos(rx)
+    # Y^-1
+    x, z = x * math.cos(ry) - z * math.sin(ry), x * math.sin(ry) + z * math.cos(ry)
+    # Z^-1
+    x, y = x * math.cos(rz) + y * math.sin(rz), -x * math.sin(rz) + y * math.cos(rz)
+    return (x, y, z)
+
+
+def _unplace(p_world, key):
+    """
+    Inverse of _place: bring a WORLD point into a key's local frame (undo the
+    translate, then the rotation). In that frame the switch cutout is the
+    axis-aligned square [-hole/2, hole/2] at z=0, which is what lets us test
+    whether a face crosses the hole accounting for the key's rotation.
+    """
+    pos = key['pos']
+    w = (p_world[0] - pos['x'], p_world[1] - pos['y'], p_world[2] - pos['z'])
+    r = key['rotation']
+    return _unrot_xyz(w, r['x'], r['y'], r['z'])
+
+
 def _norm(a):
     m = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) ** 0.5
     if m < 1e-12:
@@ -648,6 +680,12 @@ def _build_top_surface(keylist_data):
             continue
         top.face(patch_top)
 
+    # Repair any junction triangles that ended up draped over a switch cutout
+    # (e.g. a linked-key bridge meeting a corner patch on a rotated key) by
+    # flipping the shared diagonal off the hole.
+    _flip_faces_off_holes(top, keys, key_1u, hole_size,
+                          keylist_data.get('thickness', 5.0))
+
     top.offset_normal = offset_normal
     return top, hole_vert_ids
 
@@ -742,6 +780,139 @@ def _point_in_poly(p, poly):
             if x < xin:
                 inside = not inside
     return inside
+
+
+def _polys_overlap(A, B):
+    """True if two 2D polygons overlap (a vertex of one inside the other, or
+    any pair of edges crossing)."""
+    for p in A:
+        if _point_in_poly(p, B):
+            return True
+    for p in B:
+        if _point_in_poly(p, A):
+            return True
+    na, nb = len(A), len(B)
+    for i in range(na):
+        for j in range(nb):
+            if _segs_properly_cross(A[i], A[(i + 1) % na], B[j], B[(j + 1) % nb]):
+                return True
+    return False
+
+
+def _flip_faces_off_holes(top, keys, key_1u, hole_size, thickness):
+    """
+    Repair corner/bridge triangles that drape across a neighbouring switch
+    cutout.
+
+    At a junction between keys — most visibly where a `linked_keys` bridge meets
+    a diagonal corner patch — the small gap is sealed by two triangles that form
+    a quad. Those two triangles are produced by separate builders (the bridge in
+    _build_top_surface, the patch in diagonal_corner_patches) that each only
+    know three of the quad's four corners, so they can only share ONE diagonal.
+    When that diagonal is the wrong one, both triangles fan out over an adjacent
+    key's switch hole. Neither builder can choose the other diagonal alone (it
+    would need the fourth vertex), so we fix it here on the assembled surface:
+    find such a shared edge and flip it to the opposite diagonal when that lifts
+    every triangle clear of the holes.
+
+    The hole test runs in each KEY'S OWN rotated frame — the cutout is only a
+    clean axis-aligned square there. The crossing only appears once keys are
+    tilted, so a flat top-down / XY test would both miss real crossings and flag
+    false ones on angled keys.
+    """
+    if not keys:
+        return
+
+    half = hole_size / 2.0
+    hole_sq = [(-half, half), (-half, -half), (half, -half), (half, half)]
+    kinfo = [((k['pos']['x'], k['pos']['y'], k['pos']['z']), k) for k in keys]
+    ztol = thickness + 1.0
+    reach2 = (1.3 * key_1u) ** 2
+
+    def over_hole(tri_world):
+        cx = (tri_world[0][0] + tri_world[1][0] + tri_world[2][0]) / 3.0
+        cy = (tri_world[0][1] + tri_world[1][1] + tri_world[2][1]) / 3.0
+        for pos, k in kinfo:
+            if (cx - pos[0]) ** 2 + (cy - pos[1]) ** 2 > reach2:
+                continue
+            loc = [_unplace(p, k) for p in tri_world]
+            # Only faces sitting in this key's plane can occlude its cutout.
+            if abs((loc[0][2] + loc[1][2] + loc[2][2]) / 3.0) > ztol:
+                continue
+            if _polys_overlap([(p[0], p[1]) for p in loc], hole_sq):
+                return True
+        return False
+
+    P = top.points
+    faces = top.faces
+
+    # Map every triangle edge to (face_index, opposite_vertex).
+    edge_faces = {}
+    for fi, f in enumerate(faces):
+        if len(f) != 3:
+            continue
+        a, b, c = f
+        for u, v, w in ((a, b, c), (b, c, a), (c, a, b)):
+            edge_faces.setdefault(frozenset((u, v)), []).append((fi, w))
+
+    flipped = set()
+    changes = {}
+    for edge, lst in edge_faces.items():
+        if len(lst) != 2:
+            continue
+        (fi1, w1), (fi2, w2) = lst
+        if fi1 in flipped or fi2 in flipped:
+            continue
+        u, v = tuple(edge)
+        a, b = w1, w2                      # the two off-diagonal tips
+        if a == b or frozenset((a, b)) in edge_faces:
+            continue                       # would duplicate / go non-manifold
+
+        cur1 = (P[u], P[v], P[a])
+        cur2 = (P[u], P[v], P[b])
+        if not (over_hole(cur1) or over_hole(cur2)):
+            continue                       # current split is fine
+
+        new1 = (P[a], P[b], P[u])
+        new2 = (P[a], P[b], P[v])
+        if over_hole(new1) or over_hole(new2):
+            continue                       # the flip wouldn't help
+
+        # Keep the surface orientation: match each new triangle's normal to the
+        # two originals' combined normal.
+        n1 = _face_normal([P[i] for i in faces[fi1]])
+        n2 = _face_normal([P[i] for i in faces[fi2]])
+        ref = (n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2])
+
+        def _oriented(tri_idx, tri_world):
+            nrm = _face_normal(list(tri_world))
+            if nrm[0] * ref[0] + nrm[1] * ref[1] + nrm[2] * ref[2] < 0:
+                return (tri_idx[0], tri_idx[2], tri_idx[1])
+            return tri_idx
+
+        changes[fi1] = _oriented((a, b, u), new1)
+        changes[fi2] = _oriented((a, b, v), new2)
+        flipped.add(fi1)
+        flipped.add(fi2)
+
+    if not changes:
+        return
+
+    # Apply. Update accumulated vertex normals incrementally (remove the old
+    # face contribution, add the new) so untouched vertices stay bit-identical.
+    for fi, newf in changes.items():
+        oldf = faces[fi]
+        on = _face_normal([P[i] for i in oldf])
+        for i in oldf:
+            top.normals[i][0] -= on[0]
+            top.normals[i][1] -= on[1]
+            top.normals[i][2] -= on[2]
+        nn = _face_normal([P[i] for i in newf])
+        for i in newf:
+            top.normals[i][0] += nn[0]
+            top.normals[i][1] += nn[1]
+            top.normals[i][2] += nn[2]
+        faces[fi] = newf
 
 
 def _bridge_holes(outer, holes):
