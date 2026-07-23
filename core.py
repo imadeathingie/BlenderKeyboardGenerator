@@ -1098,17 +1098,16 @@ def _skirt_outer_rings(keylist_data):
     segs = _skirt_profile(keylist_data)
 
     top, hole_ids = _build_top_surface(keylist_data)
-    unit = top.unit_normals()
-    override = getattr(top, 'offset_normal', {})
 
-    # The skirt forces an aligned perimeter, so each perimeter vertex's XY is
-    # its bottom-offset XY (same as build_shell uses).
+    # Apply the SAME whole-plate tent/pitch tilt and clearance lift that
+    # build_shell applies, so the baseplate outline is taken from the tilted
+    # perimeter the case actually lands on. Without this the baseplate is built
+    # from the untilted plate and does not line up with the case, and the skirt
+    # flare below is wrong as well because it scales with each vertex's height
+    # above the base plane. The skirt forces an aligned (vertical) perimeter, so
+    # each perimeter vertex's XY is its bottom-offset XY.
+    _tilt_and_offset(keylist_data, top)
     pts = list(top.points)
-    for lp in _perimeter_loops(top, hole_ids):
-        for vi in lp:
-            u = override.get(vi, unit[vi])
-            p = top.points[vi]
-            pts[vi] = (p[0], p[1], p[2])
 
     loops = _perimeter_loops(top, hole_ids)
     if not loops:
@@ -1527,6 +1526,82 @@ def _stitch_columns(faces, vertices, col_a, col_b):
             ib += 1
 
 
+def _tilt_and_offset(keylist_data, top):
+    """
+    Apply the whole-plate tent/pitch tilt to a built TopSurface, compute the
+    constant-thickness offset bottom, and lift the result so the plate clears
+    the base plane. Mutates `top` in place and returns the bottom points.
+
+    Shared by build_shell and _skirt_outer_rings so the case and the baseplate
+    are derived from the SAME tilted, lifted perimeter. Previously only
+    build_shell tilted the plate, so with a non-zero tent_angle/pitch_angle the
+    baseplate was generated from the UNTILTED perimeter and no longer lined up
+    with the case it is supposed to close (the skirt's outward flare was wrong
+    too, since it scales with each vertex's height above the base).
+
+    Steps, in the order build_shell has always applied them:
+      1. Rotate points, accumulated face normals and per-vertex offset normals
+         about the plate's XY centre — tent_angle about Y, pitch_angle about X.
+      2. Offset the bottom a uniform `thickness` along each vertex's normal.
+      3. Lift everything so the lowest point of EITHER surface clears
+         `wall_base_z` by `plate_min_wall`, keeping every wall a positive height.
+
+    With no tilt requested this is exactly the original bottom-offset step, so
+    untilted boards are unaffected.
+    """
+    thickness = keylist_data.get('thickness', 5.0)
+    tent_angle = float(keylist_data.get('tent_angle', 0.0) or 0.0)
+    pitch_angle = float(keylist_data.get('pitch_angle', 0.0) or 0.0)
+    tilted = bool(tent_angle or pitch_angle)
+
+    if tilted:
+        pts = top.points
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+
+        def _tilt(p):
+            q = _rot_xyz((p[0] - cx, p[1] - cy, p[2]),
+                         pitch_angle, tent_angle, 0.0)
+            return (q[0] + cx, q[1] + cy, q[2])
+
+        top.points = [_tilt(p) for p in pts]
+        # Rotate the accumulated face normals and any per-vertex offset normals
+        # the same way, so the bottom offset still drops perpendicular to the
+        # (now tilted) top rather than in a stale direction.
+        top.normals = [list(_rot_xyz(tuple(nz), pitch_angle, tent_angle, 0.0))
+                       for nz in top.normals]
+        if getattr(top, 'offset_normal', None):
+            top.offset_normal = {
+                vi: _rot_xyz(nrm, pitch_angle, tent_angle, 0.0)
+                for vi, nrm in top.offset_normal.items()}
+
+    # --- Offset bottom. Cell-corner vertices use their key's plane normal
+    # (recorded in top.offset_normal) so the underside drops cleanly; all other
+    # vertices use the area-averaged normal. ---
+    unit = top.unit_normals()
+    override = getattr(top, 'offset_normal', {})
+    bot_pts = []
+    for vi, (p, ua) in enumerate(zip(top.points, unit)):
+        u = override.get(vi, ua)
+        bot_pts.append((p[0] - u[0] * thickness,
+                        p[1] - u[1] * thickness,
+                        p[2] - u[2] * thickness))
+
+    # If the plate was tented/pitched, lift the whole shell so its lowest point
+    # (top OR bottom surface) clears the base by `plate_min_wall`.
+    if tilted:
+        base_z0 = float(keylist_data.get('wall_base_z', 0.0))
+        min_clear = float(keylist_data.get('plate_min_wall', 1.0))
+        min_z = min(min(p[2] for p in top.points),
+                    min(p[2] for p in bot_pts))
+        if min_z < base_z0 + min_clear:
+            dz = (base_z0 + min_clear) - min_z
+            top.points = [(p[0], p[1], p[2] + dz) for p in top.points]
+            bot_pts = [(p[0], p[1], p[2] + dz) for p in bot_pts]
+
+    return bot_pts
+
+
 def build_shell(keylist_data):
     """
     Build a constant-thickness SHELL of the key plate (no perimeter walls yet).
@@ -1556,68 +1631,12 @@ def build_shell(keylist_data):
 
     top, hole_ids = _build_top_surface(keylist_data)
 
-    # --- Tent (side-to-side) and pitch (front-to-back) of the whole plate ----
-    # Tilt the finished key plate as a rigid body BEFORE the walls/skirt are
-    # built, so the walls still sweep straight down to `wall_base_z` from the
-    # now-tilted perimeter and the case sits flat on the desk.
-    #   tent_angle  : rotation about the Y axis (raises one side; ergonomic tent)
-    #   pitch_angle : rotation about the X axis (raises the far/near edge)
-    # Degrees. Rotation is about the plate's XY centre so it tilts in place; we
-    # then lift the plate so its lowest point clears the base by `plate_lift`
-    # (or wall_base_z), keeping every wall a positive height.
-    tent_angle = float(keylist_data.get('tent_angle', 0.0) or 0.0)
-    pitch_angle = float(keylist_data.get('pitch_angle', 0.0) or 0.0)
-    _tilted = bool(tent_angle or pitch_angle)
-    if _tilted:
-        pts = top.points
-        cx = sum(p[0] for p in pts) / len(pts)
-        cy = sum(p[1] for p in pts) / len(pts)
-
-        def _tilt(p):
-            q = _rot_xyz((p[0] - cx, p[1] - cy, p[2]),
-                         pitch_angle, tent_angle, 0.0)
-            return (q[0] + cx, q[1] + cy, q[2])
-
-        top.points = [_tilt(p) for p in pts]
-        # Rotate the accumulated face normals and any per-vertex offset normals
-        # the same way, so the bottom offset still drops perpendicular to the
-        # (now tilted) top rather than in a stale direction.
-        top.normals = [list(_rot_xyz(tuple(nz), pitch_angle, tent_angle, 0.0))
-                       for nz in top.normals]
-        if getattr(top, 'offset_normal', None):
-            top.offset_normal = {
-                vi: _rot_xyz(nrm, pitch_angle, tent_angle, 0.0)
-                for vi, nrm in top.offset_normal.items()}
-        # The vertical lift (so the tilted plate clears the base) happens after
-        # the bottom surface is built, since the plate UNDERSIDE is what must
-        # stay above wall_base_z for the walls to have positive height.
-
-    # --- Compute the offset bottom. Cell-corner vertices use their key's
-    # plane normal (recorded in top.offset_normal) so the underside drops
-    # cleanly; all other vertices use the area-averaged normal. ---
-    unit = top.unit_normals()
-    override = getattr(top, 'offset_normal', {})
+    # --- Tent (side-to-side) and pitch (front-to-back) of the whole plate,
+    # then the constant-thickness offset bottom and the clearance lift. Done in
+    # _tilt_and_offset so _skirt_outer_rings (the baseplate) can apply exactly
+    # the same transform and stay aligned with the case. ---
+    bot_pts = _tilt_and_offset(keylist_data, top)
     top_pts = list(top.points)
-    bot_pts = []
-    for vi, (p, ua) in enumerate(zip(top_pts, unit)):
-        u = override.get(vi, ua)
-        bot_pts.append((p[0] - u[0] * thickness,
-                        p[1] - u[1] * thickness,
-                        p[2] - u[2] * thickness))
-
-    # If the plate was tented/pitched, lift the whole shell so its lowest point
-    # (top OR bottom surface) clears the base by `plate_min_wall`, guaranteeing
-    # every wall has positive height and drops cleanly to wall_base_z.
-    if _tilted:
-        base_z0 = float(keylist_data.get('wall_base_z', 0.0))
-        min_clear = float(keylist_data.get('plate_min_wall', 1.0))
-        min_z = min(min(p[2] for p in top.points),
-                    min(p[2] for p in bot_pts))
-        if min_z < base_z0 + min_clear:
-            dz = (base_z0 + min_clear) - min_z
-            top.points = [(p[0], p[1], p[2] + dz) for p in top.points]
-            top_pts = [(p[0], p[1], p[2] + dz) for p in top_pts]
-            bot_pts = [(p[0], p[1], p[2] + dz) for p in bot_pts]
 
     # --- Optionally make the OUTER perimeter edge vertical so the plate drops
     # straight into the wall recess. The perpendicular bottom offset pushes
