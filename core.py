@@ -260,6 +260,17 @@ def key_edges_world(key, key_1u, thickness=5.0, hole_size=14.5,
     return [{'tl': tl, 'bl': bl, 'br': br, 'tr': tr}, {'tl': btl, 'bl': bbl, 'br': bbr, 'tr': btr}]
 
 
+def _key_plane_normal(key):
+    """
+    Unit normal of a key's own switch plane, in world space: the key's local +Z
+    after its rotation. Used both for the constant-thickness bottom offset and
+    to tell which way a face built from that key's corners ought to face.
+    """
+    o = _place((0.0, 0.0, 0.0), key)
+    z = _place((0.0, 0.0, 1.0), key)
+    return _norm((z[0] - o[0], z[1] - o[1], z[2] - o[2]))
+
+
 def _linked_targets(key):
     """
     Return this key's explicit links as {side: ((col,row), corner_or_None)}.
@@ -460,8 +471,46 @@ def diagonal_corner_patches(keys_by_cr, key_1u, link_pairs=None,
                                               switch_border)[0]
                     pts.append(corners[corner_name[name]])
 
-            if len(pts) >= 3:
-                patches.append(pts)
+            if len(pts) < 3:
+                continue
+
+            # A patch is only meaningful when it SEALS the small notch left
+            # between the surrounding edge bridges — this function's whole
+            # premise is a block whose keys' corners "nearly meet". The
+            # A->C->D->B corner order assumes that too: with the cells near
+            # their nominal grid slots the polygon comes out CCW viewed from
+            # above, the winding every top face uses.
+            #
+            # When a key is displaced well away from its grid slot and rotated
+            # (an offset thumb key, say), the shared corner between two bridges
+            # can bulge OUTWARD instead of leaving a notch. What we would emit
+            # is then not a gap filler at all: it lays a chord across the
+            # OUTSIDE of the boundary and folds back over the neighbouring
+            # bridges, leaving a stray flap of material with an inverted
+            # (downward) normal. The junction is already closed by the bridges
+            # meeting at that shared corner, so the right answer is to emit
+            # nothing and let the perimeter run around it.
+            #
+            # Require BOTH symptoms before dropping a patch:
+            #   * inverted   — the corner order came out backwards, so the
+            #                  corners are not arranged around a notch, and
+            #   * non-local  — the corners span more than one key pitch, so
+            #                  this block is not a real junction at all.
+            # A patch can legitimately come out inverted while still sealing a
+            # genuine, tight notch (steeply tilted keys do this); those stay,
+            # and the shared-diagonal repair in _flip_faces_off_holes tidies
+            # them up. Only a patch that is backwards AND stretched across a
+            # non-junction is discarded.
+            span = 0.0
+            for i in range(len(pts)):
+                for j in range(i + 1, len(pts)):
+                    dx = pts[i][0] - pts[j][0]
+                    dy = pts[i][1] - pts[j][1]
+                    span = max(span, (dx * dx + dy * dy) ** 0.5)
+            if _face_normal(pts)[2] <= 0.0 and span > key_1u:
+                continue
+
+            patches.append(pts)
 
     return patches
 
@@ -576,11 +625,6 @@ def _build_top_surface(keylist_data):
     # back to the averaged normal.
     offset_normal = {}
 
-    def _key_plane_normal(key):
-        o = _place((0.0, 0.0, 0.0), key)
-        z = _place((0.0, 0.0, 1.0), key)
-        return _norm((z[0] - o[0], z[1] - o[1], z[2] - o[2]))
-
     def cell_top_world(key):
         return [_place(p, key) for p in
                 _cell_ring(key, key_1u, hole_size, switch_border)]
@@ -685,6 +729,12 @@ def _build_top_surface(keylist_data):
     # flipping the shared diagonal off the hole.
     _flip_faces_off_holes(top, keys, key_1u, hole_size,
                           keylist_data.get('thickness', 5.0))
+
+    # Split any warped polygon into explicit triangles, so the top surface,
+    # the offset underside built from it and every downstream exporter all
+    # agree on how it is divided. Runs last, after the repair above has had its
+    # say on the quads/triangles it cares about.
+    _triangulate_nonplanar_faces(top)
 
     top.offset_normal = offset_normal
     return top, hole_vert_ids
@@ -797,6 +847,72 @@ def _polys_overlap(A, B):
             if _segs_properly_cross(A[i], A[(i + 1) % na], B[j], B[(j + 1) % nb]):
                 return True
     return False
+
+
+def _triangulate_nonplanar_faces(top, tol=1e-9):
+    """
+    Replace every NON-PLANAR polygon in the surface with explicit triangles.
+
+    A warped quad does not define a surface on its own: it has to be split
+    along one of its two diagonals, and which one is chosen changes the shape.
+    build_shell emits the underside as the same loops with REVERSED winding, so
+    a consumer that fan-triangulates from the first vertex (Blender, three.js,
+    an STL writer) splits the top quad [a,b,c,d] on a-c but the reversed bottom
+    [d,c,b,a] on d-b — the OPPOSITE diagonal. The two surfaces then are not
+    parallel, and wherever a quad's warp approaches the plate thickness they
+    cross: the underside pierces up through the top, leaving a visible sliver
+    of inverted surface. Bridges between keys that differ a lot in tilt and
+    height (an offset, rotated thumb key) warp the most and hit this first.
+
+    Splitting here, once, removes the ambiguity for everyone downstream: top,
+    underside and any exporter all use the same diagonal. We take the shorter
+    diagonal, which keeps the two triangles closest to the intended surface.
+
+    Only the face list is rewritten. The accumulated vertex normals are left
+    exactly as the original polygons set them, so unit_normals() — and with it
+    the constant-thickness bottom offset — is completely unaffected. The
+    boundary is untouched too: the four original edges each still appear once
+    and the new diagonal appears twice (interior), so perimeter loops, walls
+    and skirts are unchanged. Planar faces are left alone, since for those the
+    diagonal makes no difference to the surface.
+    """
+    out = []
+    for f in top.faces:
+        if len(f) < 4:
+            out.append(f)
+            continue
+
+        pts = [top.points[i] for i in f]
+        nrm = _norm(_face_normal(pts))
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        cz = sum(p[2] for p in pts) / len(pts)
+        warp = max(abs((p[0] - cx) * nrm[0] +
+                       (p[1] - cy) * nrm[1] +
+                       (p[2] - cz) * nrm[2]) for p in pts)
+        if warp <= tol:
+            out.append(f)
+            continue
+
+        if len(f) == 4:
+            a, b, c, d = f
+
+            def _d2(i, j):
+                pi, pj = top.points[i], top.points[j]
+                return ((pi[0] - pj[0]) ** 2 + (pi[1] - pj[1]) ** 2
+                        + (pi[2] - pj[2]) ** 2)
+
+            if _d2(a, c) <= _d2(b, d):
+                out.append((a, b, c))
+                out.append((a, c, d))
+            else:
+                out.append((b, c, d))
+                out.append((b, d, a))
+        else:
+            for k in range(1, len(f) - 1):
+                out.append((f[0], f[k], f[k + 1]))
+
+    top.faces = out
 
 
 def _flip_faces_off_holes(top, keys, key_1u, hole_size, thickness):
